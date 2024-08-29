@@ -54,12 +54,13 @@ impl Guest for ExampleFdw {
         let this = Self::this_mut();
 
         let opts = ctx.get_options(OptionsType::Table);
-        let object = opts.require("object")?;
+        let object = opts.require("object").map_err(|e| {
+            utils::report_error(&format!("Failed to get 'object' option: {}", e));
+            e
+        })?;
+        
         let url = format!("{}/{}", this.base_url, object);
-
-        let headers: Vec<(String, String)> = vec![
-            ("user-agent".to_owned(), "Example FDW".to_owned())
-        ];
+        let headers: Vec<(String, String)> = vec![("user-agent".to_owned(), "Example FDW".to_owned())];
 
         let req = http::Request {
             method: http::Method::Get,
@@ -68,18 +69,33 @@ impl Guest for ExampleFdw {
             body: String::default(),
         };
 
-        let resp = http::get(&req)?;
-        let resp_json: JsonValue = serde_json::from_str(&resp.body)
-            .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+        match http::get(&req) {
+            Ok(resp) => {
+                let resp_json: JsonValue = serde_json::from_str(&resp.body).map_err(|e| {
+                    let err_msg = format!("Failed to parse JSON response: {}", e);
+                    utils::report_error(&err_msg);
+                    err_msg
+                })?;
 
-        this.src_rows = resp_json
-            .as_array()
-            .map(|v| v.to_owned())
-            .expect("response should be a JSON array");
+                this.src_rows = resp_json
+                    .as_array()
+                    .map(|v| v.to_owned())
+                    .ok_or("Response should be a JSON array")
+                    .map_err(|e| {
+                        utils::report_error(&e);
+                        e
+                    })?;
 
-        utils::report_info(&format!("Received response array length: {}", this.src_rows.len()));
+                utils::report_info(&format!("Received response array length: {}", this.src_rows.len()));
 
-        Ok(())
+                Ok(())
+            }
+            Err(e) => {
+                let err_msg = format!("HTTP request failed: {}", e);
+                utils::report_error(&err_msg);
+                Err(err_msg)
+            }
+        }
     }
 
     fn iter_scan(ctx: &Context, row: &Row) -> Result<Option<u32>, FdwError> {
@@ -95,7 +111,7 @@ impl Guest for ExampleFdw {
             let src = src_row
                 .as_object()
                 .and_then(|v| v.get(&tgt_col_name))
-                .ok_or(format!("source column '{}' not found", tgt_col_name))?;
+                .ok_or(format!("Source column '{}' not found", tgt_col_name))?;
             
             let cell = match tgt_col.type_oid() {
                 TypeOid::Bool => src.as_bool().map(Cell::Bool),
