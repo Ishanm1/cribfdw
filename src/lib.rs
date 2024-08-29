@@ -65,13 +65,22 @@ impl Guest for ExampleFdw {
             headers,
             body: String::default(),
         };
-        let resp = http::get(&req).map_err(|e| format!("HTTP request failed: {}", e))?;
-        let resp_json: JsonValue = serde_json::from_str(&resp.body)
-            .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
-        this.src_rows = resp_json.as_array()
-            .ok_or_else(|| "Response should be a JSON array".to_string())?
-            .to_owned();
+        // Wrap HTTP request in error handling
+        let resp = match http::get(&req) {
+            Ok(response) => response,
+            Err(e) => return Err(format!("HTTP request failed: {}", e)),
+        };
+
+        let resp_json: JsonValue = match serde_json::from_str(&resp.body) {
+            Ok(json) => json,
+            Err(e) => return Err(format!("Failed to parse JSON response: {}", e)),
+        };
+
+        this.src_rows = match resp_json.as_array() {
+            Some(array) => array.to_owned(),
+            None => return Err("Response should be a JSON array".to_string()),
+        };
 
         utils::report_info(&format!("Received response with array length: {}", this.src_rows.len()));
 
@@ -88,9 +97,13 @@ impl Guest for ExampleFdw {
         let src_row = &this.src_rows[this.src_idx];
         for tgt_col in ctx.get_columns() {
             let tgt_col_name = tgt_col.name();
-            let src = src_row.as_object()
-                .and_then(|v| v.get(tgt_col_name))
-                .ok_or(format!("Source column '{}' not found", tgt_col_name))?;
+            let src = match src_row.as_object().and_then(|v| v.get(tgt_col_name)) {
+                Some(value) => value,
+                None => {
+                    return Err(format!("Source column '{}' not found", tgt_col_name).into());
+                }
+            };
+
             let cell = match tgt_col.type_oid() {
                 TypeOid::Bool => src.as_bool().map(Cell::Bool),
                 TypeOid::String => src.as_str().map(|v| Cell::String(v.to_owned())),
@@ -116,9 +129,35 @@ impl Guest for ExampleFdw {
         Ok(Some(0))
     }
 
-    // Other methods remain unchanged
+    fn re_scan(_ctx: &Context) -> FdwResult {
+        Err("re_scan on foreign table is not supported".to_owned())
+    }
+
+    fn end_scan(_ctx: &Context) -> FdwResult {
+        let this = Self::this_mut();
+        this.src_rows.clear();
+        Ok(())
+    }
+
+    fn begin_modify(_ctx: &Context) -> FdwResult {
+        Err("modify on foreign table is not supported".to_owned())
+    }
+
+    fn insert(_ctx: &Context, _row: &Row) -> FdwResult {
+        Ok(())
+    }
+
+    fn update(_ctx: &Context, _rowid: Cell, _row: &Row) -> FdwResult {
+        Ok(())
+    }
+
+    fn delete(_ctx: &Context, _rowid: Cell) -> FdwResult {
+        Ok(())
+    }
+
+    fn end_modify(_ctx: &Context) -> FdwResult {
+        Ok(())
+    }
 }
 
 bindings::export!(ExampleFdw with_types_in bindings);
-
-
