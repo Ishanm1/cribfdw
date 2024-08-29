@@ -22,7 +22,7 @@ struct ExampleFdw {
 static mut INSTANCE: *mut ExampleFdw = std::ptr::null_mut::<ExampleFdw>();
 
 impl ExampleFdw {
-    // initialize FDW instance
+    // initialise FDW instance
     fn init_instance() {
         let instance = Self::default();
         unsafe {
@@ -54,11 +54,12 @@ impl Guest for ExampleFdw {
         let this = Self::this_mut();
 
         let opts = ctx.get_options(OptionsType::Table);
-        let object = opts.require("object").map_err(|e| format!("Missing required option `object`: {}", e))?;
+        let object = opts.require("object")?;
         let url = format!("{}/{}", this.base_url, object);
 
-        let headers: Vec<(String, String)> =
-            vec![("user-agent".to_owned(), "Example FDW".to_owned())];
+        let headers: Vec<(String, String)> = vec![
+            ("user-agent".to_owned(), "Example FDW".to_owned())
+        ];
 
         let req = http::Request {
             method: http::Method::Get,
@@ -67,16 +68,16 @@ impl Guest for ExampleFdw {
             body: String::default(),
         };
 
-        let resp = http::get(&req).map_err(|e| format!("HTTP request failed: {}", e))?;
+        let resp = http::get(&req)?;
         let resp_json: JsonValue = serde_json::from_str(&resp.body)
             .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
         this.src_rows = resp_json
             .as_array()
             .map(|v| v.to_owned())
-            .ok_or("Response should be a JSON array")?;
+            .expect("response should be a JSON array");
 
-        utils::report_info(&format!("We got response array length: {}", this.src_rows.len()));
+        utils::report_info(&format!("Received response array length: {}", this.src_rows.len()));
 
         Ok(())
     }
@@ -94,7 +95,8 @@ impl Guest for ExampleFdw {
             let src = src_row
                 .as_object()
                 .and_then(|v| v.get(&tgt_col_name))
-                .ok_or(format!("Source column '{}' not found", tgt_col_name))?;
+                .ok_or(format!("source column '{}' not found", tgt_col_name))?;
+            
             let cell = match tgt_col.type_oid() {
                 TypeOid::Bool => src.as_bool().map(Cell::Bool),
                 TypeOid::String => src.as_str().map(|v| Cell::String(v.to_owned())),
