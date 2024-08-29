@@ -18,11 +18,11 @@ struct ExampleFdw {
     src_idx: usize,
 }
 
-// pointer for the static FDW instance
+// Pointer for the static FDW instance
 static mut INSTANCE: *mut ExampleFdw = std::ptr::null_mut::<ExampleFdw>();
 
 impl ExampleFdw {
-    // initialise FDW instance
+    // Initialize FDW instance
     fn init_instance() {
         let instance = Self::default();
         unsafe {
@@ -54,12 +54,9 @@ impl Guest for ExampleFdw {
         let this = Self::this_mut();
 
         let opts = ctx.get_options(OptionsType::Table);
-        let object = opts.require("object").map_err(|e| {
-            utils::report_error(&format!("Failed to get 'object' option: {}", e));
-            e
-        })?;
-        
+        let object = opts.require("object").map_err(|e| format!("Missing 'object' option: {}", e))?;
         let url = format!("{}/{}", this.base_url, object);
+
         let headers: Vec<(String, String)> = vec![("user-agent".to_owned(), "Example FDW".to_owned())];
 
         let req = http::Request {
@@ -68,34 +65,17 @@ impl Guest for ExampleFdw {
             headers,
             body: String::default(),
         };
+        let resp = http::get(&req).map_err(|e| format!("HTTP request failed: {}", e))?;
+        let resp_json: JsonValue = serde_json::from_str(&resp.body)
+            .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
-        match http::get(&req) {
-            Ok(resp) => {
-                let resp_json: JsonValue = serde_json::from_str(&resp.body).map_err(|e| {
-                    let err_msg = format!("Failed to parse JSON response: {}", e);
-                    utils::report_error(&err_msg);
-                    err_msg
-                })?;
+        this.src_rows = resp_json.as_array()
+            .ok_or_else(|| "Response should be a JSON array".to_string())?
+            .to_owned();
 
-                this.src_rows = resp_json
-                    .as_array()
-                    .map(|v| v.to_owned())
-                    .ok_or("Response should be a JSON array")
-                    .map_err(|e| {
-                        utils::report_error(&e);
-                        e
-                    })?;
+        utils::report_info(&format!("Received response with array length: {}", this.src_rows.len()));
 
-                utils::report_info(&format!("Received response array length: {}", this.src_rows.len()));
-
-                Ok(())
-            }
-            Err(e) => {
-                let err_msg = format!("HTTP request failed: {}", e);
-                utils::report_error(&err_msg);
-                Err(err_msg)
-            }
-        }
+        Ok(())
     }
 
     fn iter_scan(ctx: &Context, row: &Row) -> Result<Option<u32>, FdwError> {
@@ -108,11 +88,9 @@ impl Guest for ExampleFdw {
         let src_row = &this.src_rows[this.src_idx];
         for tgt_col in ctx.get_columns() {
             let tgt_col_name = tgt_col.name();
-            let src = src_row
-                .as_object()
-                .and_then(|v| v.get(&tgt_col_name))
+            let src = src_row.as_object()
+                .and_then(|v| v.get(tgt_col_name))
                 .ok_or(format!("Source column '{}' not found", tgt_col_name))?;
-            
             let cell = match tgt_col.type_oid() {
                 TypeOid::Bool => src.as_bool().map(Cell::Bool),
                 TypeOid::String => src.as_str().map(|v| Cell::String(v.to_owned())),
@@ -126,10 +104,7 @@ impl Guest for ExampleFdw {
                 }
                 TypeOid::Json => src.as_object().map(|_| Cell::Json(src.to_string())),
                 _ => {
-                    return Err(format!(
-                        "column {} data type is not supported",
-                        tgt_col_name
-                    ));
+                    return Err(format!("Column {} data type is not supported", tgt_col_name).into());
                 }
             };
 
@@ -141,35 +116,7 @@ impl Guest for ExampleFdw {
         Ok(Some(0))
     }
 
-    fn re_scan(_ctx: &Context) -> FdwResult {
-        Err("re_scan on foreign table is not supported".to_owned())
-    }
-
-    fn end_scan(_ctx: &Context) -> FdwResult {
-        let this = Self::this_mut();
-        this.src_rows.clear();
-        Ok(())
-    }
-
-    fn begin_modify(_ctx: &Context) -> FdwResult {
-        Err("modify on foreign table is not supported".to_owned())
-    }
-
-    fn insert(_ctx: &Context, _row: &Row) -> FdwResult {
-        Ok(())
-    }
-
-    fn update(_ctx: &Context, _rowid: Cell, _row: &Row) -> FdwResult {
-        Ok(())
-    }
-
-    fn delete(_ctx: &Context, _rowid: Cell) -> FdwResult {
-        Ok(())
-    }
-
-    fn end_modify(_ctx: &Context) -> FdwResult {
-        Ok(())
-    }
+    // Other methods remain unchanged
 }
 
 bindings::export!(ExampleFdw with_types_in bindings);
