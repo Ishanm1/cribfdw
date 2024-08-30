@@ -18,11 +18,11 @@ struct ExampleFdw {
     src_idx: usize,
 }
 
-// pointer for the static FDW instance
+// Static instance pointer for the FDW
 static mut INSTANCE: *mut ExampleFdw = std::ptr::null_mut::<ExampleFdw>();
 
 impl ExampleFdw {
-    // initialize FDW instance
+    // Initialize the FDW instance
     fn init_instance() {
         let instance = Self::default();
         unsafe {
@@ -30,6 +30,7 @@ impl ExampleFdw {
         }
     }
 
+    // Get a mutable reference to the FDW instance
     fn this_mut() -> &'static mut Self {
         unsafe { &mut (*INSTANCE) }
     }
@@ -37,6 +38,7 @@ impl ExampleFdw {
 
 impl Guest for ExampleFdw {
     fn host_version_requirement() -> String {
+        // SemVer requirement for the FDW host version
         "^0.1.0".to_string()
     }
 
@@ -44,9 +46,9 @@ impl Guest for ExampleFdw {
         Self::init_instance();
         let this = Self::this_mut();
 
-        // get API URL from foreign server options if it is specified
+        // Retrieve the base URL from the server options
         let opts = ctx.get_options(OptionsType::Server);
-        this.base_url = opts.require_or("base_url", "https://docs.google.com/spreadsheets/d");
+        this.base_url = opts.require_or("api_url", "https://api.github.com");
 
         Ok(())
     }
@@ -54,41 +56,33 @@ impl Guest for ExampleFdw {
     fn begin_scan(ctx: &Context) -> FdwResult {
         let this = Self::this_mut();
 
-        // get sheet id from foreign table options and make the request URL
+        // Get the object (Google Sheet or range) from table options
         let opts = ctx.get_options(OptionsType::Table);
-        let sheet_id = opts.require("sheet_id").map_err(|e| {
-            format!("Required option 'sheet_id' missing or incorrect: {}", e)
-        })?;
-        let url = format!("{}/{}/gviz/tq?tqx=out:json", this.base_url, sheet_id);
+        let object = opts.require("object").map_err(|_| "Missing required option: 'object'")?;
+        let url = format!("{}/{}", this.base_url, object);
 
-        // make up request headers
-        let headers: Vec<(String, String)> = vec![
-            ("user-agent".to_owned(), "Sheets FDW".to_owned()),
-            ("x-datasource-auth".to_owned(), "true".to_owned()),
-        ];
+        // Define request headers
+        let headers: Vec<(String, String)> = vec![("user-agent".to_owned(), "Example FDW".to_owned())];
 
-        // make a request to Google API and parse response as JSON
+        // Make an HTTP GET request to the API
         let req = http::Request {
             method: http::Method::Get,
             url,
             headers,
             body: String::default(),
         };
-        let resp = http::get(&req).map_err(|e| {
-            format!("Failed to fetch data from Google Sheets: {}", e)
-        })?;
+        
+        // Fetch data from the URL and parse it as JSON
+        let resp = http::get(&req)?;
+        let resp_json: JsonValue = serde_json::from_str(&resp.body).map_err(|e| e.to_string())?;
 
-        let body = resp.body.strip_prefix(")]}'\n").ok_or("Invalid JSON response prefix")?;
-        let resp_json: JsonValue = serde_json::from_str(&body).map_err(|e| {
-            format!("Failed to parse JSON response: {}", e)
-        })?;
-
+        // Ensure the response is a JSON array
         this.src_rows = resp_json
-            .pointer("/table/rows")
-            .ok_or("Cannot get rows from response")
-            .map(|v| v.as_array().unwrap().to_owned())?;
+            .as_array()
+            .cloned()
+            .ok_or_else(|| "Response is not a JSON array".to_string())?;
 
-        utils::report_info(&format!("We got response array length: {}", this.src_rows.len()));
+        utils::report_info(&format!("Fetched {} rows from Google Sheets", this.src_rows.len()));
 
         Ok(())
     }
@@ -96,6 +90,7 @@ impl Guest for ExampleFdw {
     fn iter_scan(ctx: &Context, row: &Row) -> Result<Option<u32>, FdwError> {
         let this = Self::this_mut();
 
+        // Check if all source rows are consumed
         if this.src_idx >= this.src_rows.len() {
             return Ok(None);
         }
@@ -103,31 +98,39 @@ impl Guest for ExampleFdw {
         let src_row = &this.src_rows[this.src_idx];
         for tgt_col in ctx.get_columns() {
             let tgt_col_name = tgt_col.name();
-            let src = src_row
-                .pointer(&format!("/c/{}/v", tgt_col.num() - 1))
-                .ok_or(format!("source column '{}' not found", tgt_col_name))?;
+            let src_value = src_row
+                .as_object()
+                .and_then(|v| v.get(tgt_col_name))
+                .ok_or_else(|| format!("Source column '{}' not found", tgt_col_name))?;
 
+            // Map source value to the appropriate cell type
             let cell = match tgt_col.type_oid() {
-                TypeOid::I64 => src.as_f64().map(|v| Cell::I64(v as _)),
-                TypeOid::String => src.as_str().map(|v| Cell::String(v.to_owned())),
+                TypeOid::Bool => src_value.as_bool().map(Cell::Bool),
+                TypeOid::String => src_value.as_str().map(|v| Cell::String(v.to_owned())),
+                TypeOid::Timestamp => {
+                    if let Some(s) = src_value.as_str() {
+                        let ts = time::parse_from_rfc3339(s).map_err(|e| e.to_string())?;
+                        Some(Cell::Timestamp(ts))
+                    } else {
+                        None
+                    }
+                }
+                TypeOid::Json => src_value.as_object().map(|_| Cell::Json(src_value.to_string())),
                 _ => {
-                    return Err(format!(
-                        "column {} data type is not supported",
-                        tgt_col_name
-                    ));
+                    return Err(format!("Unsupported column data type for '{}'", tgt_col_name).into());
                 }
             };
 
             row.push(cell.as_ref());
         }
 
-        this.src_idx += 1;
+        this.src_idx += 1; // Move to the next row
 
         Ok(Some(0))
     }
 
     fn re_scan(_ctx: &Context) -> FdwResult {
-        Err("re_scan on foreign table is not supported".to_owned())
+        Err("Re-scan on foreign table is not supported".to_owned())
     }
 
     fn end_scan(_ctx: &Context) -> FdwResult {
@@ -137,7 +140,7 @@ impl Guest for ExampleFdw {
     }
 
     fn begin_modify(_ctx: &Context) -> FdwResult {
-        Err("modify on foreign table is not supported".to_owned())
+        Err("Modify on foreign table is not supported".to_owned())
     }
 
     fn insert(_ctx: &Context, _row: &Row) -> FdwResult {
@@ -157,4 +160,6 @@ impl Guest for ExampleFdw {
     }
 }
 
+// Export the FDW with type information
 bindings::export!(ExampleFdw with_types_in bindings);
+
