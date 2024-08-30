@@ -5,7 +5,7 @@ use serde_json::Value as JsonValue;
 use bindings::{
     exports::supabase::wrappers::routines::Guest,
     supabase::wrappers::{
-        http, time,
+        http, 
         types::{Cell, Context, FdwError, FdwResult, OptionsType, Row, TypeOid},
         utils,
     },
@@ -46,7 +46,8 @@ impl Guest for ExampleFdw {
         let this = Self::this_mut();
 
         let opts = ctx.get_options(OptionsType::Server);
-        this.base_url = opts.require_or("api_url", "https://docs.google.com/spreadsheets/d");
+        // Use 'api_url' if provided, otherwise default to Google Sheets API
+        this.base_url = opts.get("api_url").unwrap_or("https://docs.google.com/spreadsheets/d").to_string();
 
         Ok(())
     }
@@ -58,22 +59,35 @@ impl Guest for ExampleFdw {
         let object = opts.require("object").map_err(|_| "Missing required option: 'object'")?;
         let url = format!("{}/{}/gviz/tq?tqx=out:json", this.base_url, object);
 
+        utils::report_info(&format!("Requesting URL: {}", url));
+
         let headers: Vec<(String, String)> = vec![("user-agent".to_owned(), "Example FDW".to_owned())];
 
         let req = http::Request {
             method: http::Method::Get,
-            url,
+            url: url.clone(),
             headers,
             body: String::default(),
         };
-        
+
         let resp = http::get(&req)?;
-        let resp_json: JsonValue = serde_json::from_str(&resp.body).map_err(|e| e.to_string())?;
+
+        // Log response for debugging
+        utils::report_info(&format!("Received response: {}", resp.body));
+
+        let resp_json: JsonValue = serde_json::from_str(&resp.body).map_err(|e| {
+            utils::report_error(&format!("Failed to parse JSON: {}", e));
+            e.to_string()
+        })?;
 
         this.src_rows = resp_json
             .pointer("/table/rows")
             .and_then(|v| v.as_array().cloned())
-            .ok_or_else(|| "Response is not a JSON array".to_string())?;
+            .ok_or_else(|| {
+                let err_msg = "Response is not a JSON array".to_string();
+                utils::report_error(&err_msg);
+                err_msg
+            })?;
 
         utils::report_info(&format!("Fetched {} rows from Google Sheets", this.src_rows.len()));
 
@@ -92,14 +106,18 @@ impl Guest for ExampleFdw {
             let tgt_col_name = tgt_col.name();
             let src_value = src_row
                 .pointer(&format!("/c/{}/v", tgt_col.num() - 1))
-                .ok_or_else(|| format!("Source column '{}' not found", tgt_col_name))?;
+                .ok_or_else(|| {
+                    let err_msg = format!("Source column '{}' not found", tgt_col_name);
+                    utils::report_error(&err_msg);
+                    err_msg
+                })?;
 
-            let cell = match tgt_col.type_oid() {
-                TypeOid::String => src_value.as_str().map(|v| Cell::String(v.to_owned())),
-                _ => {
-                    return Err(format!("Unsupported column data type for '{}'", tgt_col_name).into());
-                }
-            };
+            // Treat all values as strings
+            let cell = src_value.as_str().map(|v| Cell::String(v.to_owned())).ok_or_else(|| {
+                let err_msg = format!("Could not convert value to string for column '{}'", tgt_col_name);
+                utils::report_error(&err_msg);
+                err_msg
+            })?;
 
             row.push(cell.as_ref());
         }
@@ -139,9 +157,6 @@ impl Guest for ExampleFdw {
         Ok(())
     }
 }
-
-bindings::export!(ExampleFdw with_types_in bindings);
-
 
 // Export the FDW with type information
 bindings::export!(ExampleFdw with_types_in bindings);
