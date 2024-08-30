@@ -18,11 +18,11 @@ struct ExampleFdw {
     src_idx: usize,
 }
 
-// Pointer for the static FDW instance
+// pointer for the static FDW instance
 static mut INSTANCE: *mut ExampleFdw = std::ptr::null_mut::<ExampleFdw>();
 
 impl ExampleFdw {
-    // Initialize FDW instance
+    // initialize FDW instance
     fn init_instance() {
         let instance = Self::default();
         unsafe {
@@ -44,8 +44,9 @@ impl Guest for ExampleFdw {
         Self::init_instance();
         let this = Self::this_mut();
 
+        // get API URL from foreign server options if it is specified
         let opts = ctx.get_options(OptionsType::Server);
-        this.base_url = opts.require_or("api_url", "https://api.github.com");
+        this.base_url = opts.require_or("base_url", "https://docs.google.com/spreadsheets/d");
 
         Ok(())
     }
@@ -53,36 +54,41 @@ impl Guest for ExampleFdw {
     fn begin_scan(ctx: &Context) -> FdwResult {
         let this = Self::this_mut();
 
+        // get sheet id from foreign table options and make the request URL
         let opts = ctx.get_options(OptionsType::Table);
-        let object = opts.require("object").map_err(|e| format!("Missing 'object' option: {}", e))?;
-        let url = format!("{}/{}", this.base_url, object);
+        let sheet_id = opts.require("sheet_id").map_err(|e| {
+            format!("Required option 'sheet_id' missing or incorrect: {}", e)
+        })?;
+        let url = format!("{}/{}/gviz/tq?tqx=out:json", this.base_url, sheet_id);
 
-        let headers: Vec<(String, String)> = vec![("user-agent".to_owned(), "Example FDW".to_owned())];
+        // make up request headers
+        let headers: Vec<(String, String)> = vec![
+            ("user-agent".to_owned(), "Sheets FDW".to_owned()),
+            ("x-datasource-auth".to_owned(), "true".to_owned()),
+        ];
 
+        // make a request to Google API and parse response as JSON
         let req = http::Request {
             method: http::Method::Get,
             url,
             headers,
             body: String::default(),
         };
+        let resp = http::get(&req).map_err(|e| {
+            format!("Failed to fetch data from Google Sheets: {}", e)
+        })?;
 
-        // Wrap HTTP request in error handling
-        let resp = match http::get(&req) {
-            Ok(response) => response,
-            Err(e) => return Err(format!("HTTP request failed: {}", e)),
-        };
+        let body = resp.body.strip_prefix(")]}'\n").ok_or("Invalid JSON response prefix")?;
+        let resp_json: JsonValue = serde_json::from_str(&body).map_err(|e| {
+            format!("Failed to parse JSON response: {}", e)
+        })?;
 
-        let resp_json: JsonValue = match serde_json::from_str(&resp.body) {
-            Ok(json) => json,
-            Err(e) => return Err(format!("Failed to parse JSON response: {}", e)),
-        };
+        this.src_rows = resp_json
+            .pointer("/table/rows")
+            .ok_or("Cannot get rows from response")
+            .map(|v| v.as_array().unwrap().to_owned())?;
 
-        this.src_rows = match resp_json.as_array() {
-            Some(array) => array.to_owned(),
-            None => return Err("Response should be a JSON array".to_string()),
-        };
-
-        utils::report_info(&format!("Received response with array length: {}", this.src_rows.len()));
+        utils::report_info(&format!("We got response array length: {}", this.src_rows.len()));
 
         Ok(())
     }
@@ -97,27 +103,18 @@ impl Guest for ExampleFdw {
         let src_row = &this.src_rows[this.src_idx];
         for tgt_col in ctx.get_columns() {
             let tgt_col_name = tgt_col.name();
-            let src = match src_row.as_object().and_then(|v| v.get(tgt_col_name)) {
-                Some(value) => value,
-                None => {
-                    return Err(format!("Source column '{}' not found", tgt_col_name).into());
-                }
-            };
+            let src = src_row
+                .pointer(&format!("/c/{}/v", tgt_col.num() - 1))
+                .ok_or(format!("source column '{}' not found", tgt_col_name))?;
 
             let cell = match tgt_col.type_oid() {
-                TypeOid::Bool => src.as_bool().map(Cell::Bool),
+                TypeOid::I64 => src.as_f64().map(|v| Cell::I64(v as _)),
                 TypeOid::String => src.as_str().map(|v| Cell::String(v.to_owned())),
-                TypeOid::Timestamp => {
-                    if let Some(s) = src.as_str() {
-                        let ts = time::parse_from_rfc3339(s)?;
-                        Some(Cell::Timestamp(ts))
-                    } else {
-                        None
-                    }
-                }
-                TypeOid::Json => src.as_object().map(|_| Cell::Json(src.to_string())),
                 _ => {
-                    return Err(format!("Column {} data type is not supported", tgt_col_name).into());
+                    return Err(format!(
+                        "column {} data type is not supported",
+                        tgt_col_name
+                    ));
                 }
             };
 
