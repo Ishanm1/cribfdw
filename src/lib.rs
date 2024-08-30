@@ -48,7 +48,7 @@ impl Guest for ExampleFdw {
 
         // Retrieve the base URL from the server options
         let opts = ctx.get_options(OptionsType::Server);
-        this.base_url = opts.require_or("api_url", "https://api.github.com");
+        this.base_url = opts.require_or("api_url", "https://docs.google.com/spreadsheets/d");
 
         Ok(())
     }
@@ -59,7 +59,7 @@ impl Guest for ExampleFdw {
         // Get the object (Google Sheet or range) from table options
         let opts = ctx.get_options(OptionsType::Table);
         let object = opts.require("object").map_err(|_| "Missing required option: 'object'")?;
-        let url = format!("{}/{}", this.base_url, object);
+        let url = format!("{}/{}/gviz/tq?tqx=out:json", this.base_url, object);
 
         // Define request headers
         let headers: Vec<(String, String)> = vec![("user-agent".to_owned(), "Example FDW".to_owned())];
@@ -78,8 +78,8 @@ impl Guest for ExampleFdw {
 
         // Ensure the response is a JSON array
         this.src_rows = resp_json
-            .as_array()
-            .cloned()
+            .pointer("/table/rows")
+            .and_then(|v| v.as_array().cloned())
             .ok_or_else(|| "Response is not a JSON array".to_string())?;
 
         utils::report_info(&format!("Fetched {} rows from Google Sheets", this.src_rows.len()));
@@ -99,23 +99,13 @@ impl Guest for ExampleFdw {
         for tgt_col in ctx.get_columns() {
             let tgt_col_name = tgt_col.name();
             let src_value = src_row
-                .as_object()
-                .and_then(|v| v.get(tgt_col_name))
+                .pointer(&format!("/c/{}/v", tgt_col.num() - 1))
                 .ok_or_else(|| format!("Source column '{}' not found", tgt_col_name))?;
 
             // Map source value to the appropriate cell type
             let cell = match tgt_col.type_oid() {
-                TypeOid::Bool => src_value.as_bool().map(Cell::Bool),
+                TypeOid::I64 => src_value.as_f64().map(|v| Cell::I64(v as i64)),
                 TypeOid::String => src_value.as_str().map(|v| Cell::String(v.to_owned())),
-                TypeOid::Timestamp => {
-                    if let Some(s) = src_value.as_str() {
-                        let ts = time::parse_from_rfc3339(s).map_err(|e| e.to_string())?;
-                        Some(Cell::Timestamp(ts))
-                    } else {
-                        None
-                    }
-                }
-                TypeOid::Json => src_value.as_object().map(|_| Cell::Json(src_value.to_string())),
                 _ => {
                     return Err(format!("Unsupported column data type for '{}'", tgt_col_name).into());
                 }
