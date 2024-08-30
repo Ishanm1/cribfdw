@@ -106,6 +106,7 @@ impl Guest for ExampleFdw {
             let cell = match tgt_col.type_oid() {
                 TypeOid::I64 => src_value.as_f64().map(|v| Cell::I64(v as i64)),
                 TypeOid::String => src_value.as_str().map(|v| Cell::String(v.to_owned())),
+                TypeOid::Numeric => src_value.as_str().map(|v| Cell::Numeric(v.parse().unwrap_or_default())),
                 _ => {
                     return Err(format!("Unsupported column data type for '{}'", tgt_col_name).into());
                 }
