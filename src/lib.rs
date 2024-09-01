@@ -1,130 +1,72 @@
-use serde_json::Value as JsonValue;
+use postgres::{Client, NoTls, Row};
+use semver::{Version, Op};
 
-use bindings::{
-    exports::supabase::wrappers::routines::Guest,
-    supabase::wrappers::{
-        http, 
-        types::{Cell, Context, FdwError, FdwResult, OptionsType, Row, TypeOid},
-        utils,
-    },
-};
+fn main() {
+    let mut client = Client::connect("host=localhost user=postgres password=postgres dbname=postgres", NoTls).unwrap();
 
-#[derive(Debug, Default)]
-struct GoogleSheetsFdw {
-    base_url: String,
-    src_rows: Vec<JsonValue>,
-    src_idx: usize,
+    // Clean up existing objects to avoid conflicts
+    clean_up_existing_objects(&mut client);
+
+    // Install necessary extension for FDWs
+    install_fdw_extension(&mut client);
+
+    // Create the foreign data wrapper for Wasm
+    create_fdw(&mut client);
+
+    // Define the server for the Google Sheets FDW with the updated checksum
+    create_server(&mut client);
+
+    // Create schema to isolate Google Sheets data
+    create_schema(&mut client);
+
+    // Define the foreign table linked to Google Sheets, all columns as TEXT
+    create_foreign_table(&mut client);
 }
 
-static mut INSTANCE: *mut GoogleSheetsFdw = std::ptr::null_mut::<GoogleSheetsFdw>();
-
-impl GoogleSheetsFdw {
-    fn init_instance() {
-        let instance = Self::default();
-        unsafe {
-            INSTANCE = Box::leak(Box::new(instance));
-        }
+fn clean_up_existing_objects(client: &mut Client) {
+    // Check and drop existing FDW if it exists
+    let fdw_exists = client.query_one("SELECT 1 FROM pg_foreign_data_wrapper WHERE fdwname = 'wasm_wrapper'", &[]).is_ok();
+    if fdw_exists {
+        client.execute("DROP FOREIGN DATA WRAPPER IF EXISTS wasm_wrapper CASCADE", &[]).unwrap();
     }
 
-    fn this_mut() -> &'static mut Self {
-        unsafe { &mut (*INSTANCE) }
+    // Check and drop existing server if it exists
+    let server_exists = client.query_one("SELECT 1 FROM pg_foreign_server WHERE srvname = 'google_sheets_server'", &[]).is_ok();
+    if server_exists {
+        client.execute("DROP SERVER IF EXISTS google_sheets_server CASCADE", &[]).unwrap();
+    }
+
+    // Check and drop existing schema if it exists
+    let schema_exists = client.query_one("SELECT 1 FROM information_schema.schemata WHERE schema_name = 'google'", &[]).is_ok();
+    if schema_exists {
+        client.execute("DROP SCHEMA IF EXISTS google CASCADE", &[]).unwrap();
     }
 }
 
-impl Guest for GoogleSheetsFdw {
-    fn host_version_requirement() -> String {
-        "^0.1.0".to_string()
-    }
-
-    fn init(ctx: &Context) -> FdwResult {
-        Self::init_instance();
-        let this = Self::this_mut();
-
-        let opts = ctx.get_options(OptionsType::Server);
-        this.base_url = opts.get("api_url").unwrap_or("https://docs.google.com/spreadsheets/d").to_string();
-
-        Ok(())
-    }
-
-    fn begin_scan(ctx: &Context) -> FdwResult {
-        let this = Self::this_mut();
-
-        let opts = ctx.get_options(OptionsType::Table);
-        let sheet_id = opts.require("sheet_id").map_err(|e| format!("Missing required option: 'sheet_id': {}", e))?;
-        let object = opts.require("object").map_err(|e| format!("Missing required option: 'object': {}", e))?;
-        let url = format!("{}/{}/gviz/tq?tqx=out:json&sheet={}", this.base_url, sheet_id, object);
-
-        utils::report_info(&format!("Requesting URL: {}", url));
-
-        let headers: Vec<(String, String)> = vec![("user-agent".to_owned(), "GoogleSheetsFDW".to_owned())];
-
-        let req = http::Request {
-            method: http::Method::Get,
-            url: url.clone(),
-            headers,
-            body: String::default(),
-        };
-
-        let resp = http::get(&req).map_err(|e| format!("HTTP request failed: {}", e))?;
-
-        utils::report_info(&format!("Received response: {}", resp.body));
-
-        // Remove the prefix and suffix from the response body
-        let json_str = resp.body.trim_start_matches(")]}'\n").trim();
-        let resp_json: JsonValue = serde_json::from_str(json_str)
-            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
-
-        this.src_rows = resp_json
-            .pointer("/table/rows")
-            .and_then(|v| v.as_array().cloned())
-            .ok_or_else(|| "Response does not contain expected 'table/rows' structure".to_string())?;
-
-        utils::report_info(&format!("Fetched {} rows from Google Sheets", this.src_rows.len()));
-
-        Ok(())
-    }
-
-    fn iter_scan(ctx: &Context, row: &Row) -> Result<Option<u32>, FdwError> {
-        let this = Self::this_mut();
-
-        if this.src_idx >= this.src_rows.len() {
-            return Ok(None);
-        }
-
-        let src_row = &this.src_rows[this.src_idx];
-        for (i, tgt_col) in ctx.get_columns().iter().enumerate() {
-            let src_value = src_row
-                .pointer(&format!("/c/{}/v", i))
-                .ok_or_else(|| format!("Source column '{}' not found", tgt_col.name()))?;
-
-            let cell = match src_value {
-                JsonValue::String(s) => Cell::String(s.clone()),
-                JsonValue::Number(n) => Cell::String(n.to_string()),
-                JsonValue::Bool(b) => Cell::String(b.to_string()),
-                JsonValue::Null => Cell::Null,
-                _ => Cell::String(src_value.to_string()),
-            };
-
-            row.push(cell.as_ref());
-        }
-
-        this.src_idx += 1;
-
-        Ok(Some(0))
-    }
-
-    fn re_scan(_ctx: &Context) -> FdwResult {
-        Err("Re-scan on foreign table is not supported".to_owned())
-    }
-
-    fn end_scan(_ctx: &Context) -> FdwResult {
-        let this = Self::this_mut();
-        this.src_rows.clear();
-        this.src_idx = 0;
-        Ok(())
-    }
-
-    // Implement other required methods...
+fn install_fdw_extension(client: &mut Client) {
+    client.execute("CREATE EXTENSION IF NOT EXISTS wrappers WITH SCHEMA extensions", &[]).unwrap();
 }
 
-bindings::export!(GoogleSheetsFdw with_types_in bindings);
+fn create_fdw(client: &mut Client) {
+    client.execute("CREATE FOREIGN DATA WRAPPER wasm_wrapper HANDLER wasm_fdw_handler VALIDATOR wasm_fdw_validator", &[]).unwrap();
+}
+
+fn create_server(client: &mut Client) {
+    let fdw_package_url = "https://github.com/ishanm1/cribfdw/releases/download/v0.2.0/wasm_fdw_example.wasm";
+    let fdw_package_name = "my-company:example-fdw";
+    let fdw_package_version = "0.2.0";
+    let fdw_package_checksum = "88781ca13e15c368c9b5be09c6032b641479b85d05d4624ed92ed9a3af0bd290";
+
+    client.execute("CREATE SERVER google_sheets_server FOREIGN DATA WRAPPER wasm_wrapper OPTIONS (fdw_package_url $1, fdw_package_name $2, fdw_package_version $3, fdw_package_checksum $4)", &[&fdw_package_url, &fdw_package_name, &fdw_package_version, &fdw_package_checksum]).unwrap();
+}
+
+fn create_schema(client: &mut Client) {
+    client.execute("CREATE SCHEMA IF NOT EXISTS google", &[]).unwrap();
+}
+
+fn create_foreign_table(client: &mut Client) {
+    let sheet_id = "1bw3CDIlIDHwo0y6U5fV7cTv_UsGJ9Tf5Xan7h0eNNPY";
+    let object = "CribCDN";
+
+    client.execute("CREATE FOREIGN TABLE IF NOT EXISTS google.sheets_data (\"Price\" TEXT, \"Bedrooms\" TEXT, \"Bathrooms\" TEXT, \"Square Footage\" TEXT, \"Listing Area\" TEXT, \"Downpayment or Income Requirement\" TEXT, \"Description\" TEXT) SERVER google_sheets_server OPTIONS (sheet_id $1, object $2)", &[&sheet_id, &object]).unwrap();
+}
