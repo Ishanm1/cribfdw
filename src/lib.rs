@@ -1,156 +1,85 @@
-use serde_json::Value as JsonValue;
-use wit_bindgen_rt::wasm_result;
+// Import necessary crates and modules
+use std::collections::HashMap;
+use serde_json;
+use reqwest;
+use std::error::Error;
 
-use supabase_wrappers::{
-    exports::supabase::wrappers::routines::Guest,
-    supabase::wrappers::{
-        http, time,
-        types::{Cell, Context, FdwError, FdwResult, OptionsType, Row, TypeOid},
-        utils,
-    },
-};
-
-#[derive(Debug, Default)]
-struct ExampleFdw {
-    base_url: String,
-    src_rows: Vec<JsonValue>,
-    src_idx: usize,
+// Define the FDW state struct to hold necessary data and state information
+struct MyFDWState {
+    base_url: String,                // Base URL for Google Sheets API request
+    options: HashMap<String, String>, // Options provided to the FDW
+    parsed_data: Vec<MyFDWRow>,      // Parsed rows from Google Sheets
 }
 
-// pointer for the static FDW instance
-static mut INSTANCE: *mut ExampleFdw = std::ptr::null_mut::<ExampleFdw>();
-
-impl ExampleFdw {
-    // initialise FDW instance
-    fn init_instance() {
-        let instance = Self::default();
-        unsafe {
-            INSTANCE = Box::leak(Box::new(instance));
-        }
-    }
-
-    fn this_mut() -> &'static mut Self {
-        unsafe { &mut (*INSTANCE) }
-    }
+// Define the row struct to represent each row of data from Google Sheets
+struct MyFDWRow {
+    price: String,
+    bedrooms: String,
 }
 
-impl Guest for ExampleFdw {
-    fn host_version_requirement() -> String {
-        // semver expression for Wasm FDW host version requirement
-        // ref: https://docs.rs/semver/latest/semver/enum.Op.html
-        "^0.1.0".to_string()
+// Initialize the FDW state with options provided by PostgreSQL
+fn init(options: &HashMap<String, String>) -> Result<MyFDWState, Box<dyn Error>> {
+    // Retrieve the Google Sheet ID from options
+    let sheet_id = options.get("sheet_id").ok_or("Missing sheet_id option")?;
+    
+    // Construct the base URL for the Google Sheets API request
+    let base_url = format!(
+        "https://docs.google.com/spreadsheets/d/{}/gviz/tq?tqx=out:json",
+        sheet_id
+    );
+
+    // Initialize and return the FDW state
+    Ok(MyFDWState {
+        base_url,
+        options: options.clone(),
+        parsed_data: Vec::new(),
+    })
+}
+
+// Function to begin scanning the data from Google Sheets
+fn begin_scan(state: &mut MyFDWState) -> Result<(), Box<dyn Error>> {
+    // Make an HTTP GET request to fetch data from Google Sheets
+    let response = reqwest::blocking::get(&state.base_url)?;
+    let json_data = response.text()?;
+    
+    // Parse the JSON response into rows
+    state.parsed_data = parse_json_to_rows(&json_data)?;
+
+    Ok(())
+}
+
+// Helper function to parse JSON data into a vector of rows
+fn parse_json_to_rows(json_data: &str) -> Result<Vec<MyFDWRow>, Box<dyn Error>> {
+    let mut rows = Vec::new();
+    
+    // Parse JSON using serde_json
+    let parsed: serde_json::Value = serde_json::from_str(json_data)?;
+
+    // Iterate over the rows in the JSON response
+    for entry in parsed["table"]["rows"].as_array().unwrap() {
+        let price = entry["c"][0]["v"].as_str().unwrap_or("").to_string();
+        let bedrooms = entry["c"][1]["v"].as_str().unwrap_or("").to_string();
+        rows.push(MyFDWRow { price, bedrooms });
     }
 
-    fn init(ctx: &Context) -> FdwResult {
-        Self::init_instance();
-        let this = Self::this_mut();
+    Ok(rows)
+}
 
-        let opts = ctx.get_options(OptionsType::Server);
-        this.base_url = opts.require_or("api_url", "https://api.github.com");
-
-        Ok(())
-    }
-
-    fn begin_scan(ctx: &Context) -> FdwResult {
-        let this = Self::this_mut();
-
-        let opts = ctx.get_options(OptionsType::Table);
-        let object = opts.require("object")?;
-        let url = format!("{}/{}", this.base_url, object);
-
-        let headers: Vec<(String, String)> =
-            vec![("user-agent".to_owned(), "Example FDW".to_owned())];
-
-        let req = http::Request {
-            method: http::Method::Get,
-            url,
-            headers,
-            body: String::default(),
-        };
-        let resp = http::get(&req)?;
-        let resp_json: JsonValue = serde_json::from_str(&resp.body).map_err(|e| e.to_string())?;
-
-        this.src_rows = resp_json
-            .as_array()
-            .map(|v| v.to_owned())
-            .expect("response should be a JSON array");
-
-        utils::report_info(&format!("We got response array length: {}", this.src_rows.len()));
-
-        Ok(())
-    }
-
-    fn iter_scan(ctx: &Context, row: &Row) -> Result<Option<u32>, FdwError> {
-        let this = Self::this_mut();
-
-        if this.src_idx >= this.src_rows.len() {
-            return Ok(None);
-        }
-
-        let src_row = &this.src_rows[this.src_idx];
-        for tgt_col in ctx.get_columns() {
-            let tgt_col_name = tgt_col.name();
-            let src = src_row
-                .as_object()
-                .and_then(|v| v.get(&tgt_col_name))
-                .ok_or(format!("source column '{}' not found", tgt_col_name))?;
-            let cell = match tgt_col.type_oid() {
-                TypeOid::Bool => src.as_bool().map(Cell::Bool),
-                TypeOid::String => src.as_str().map(|v| Cell::String(v.to_owned())),
-                TypeOid::Timestamp => {
-                    if let Some(s) = src.as_str() {
-                        let ts = time::parse_from_rfc3339(s)?;
-                        Some(Cell::Timestamp(ts))
-                    } else {
-                        None
-                    }
-                }
-                TypeOid::Json => src.as_object().map(|_| Cell::Json(src.to_string())),
-                _ => {
-                    return Err(format!(
-                        "column {} data type is not supported",
-                        tgt_col_name
-                    ));
-                }
-            };
-
-            row.push(cell.as_ref());
-        }
-
-        this.src_idx += 1;
-
-        Ok(Some(0))
-    }
-
-    fn re_scan(_ctx: &Context) -> FdwResult {
-        Err("re_scan on foreign table is not supported".to_owned())
-    }
-
-    fn end_scan(_ctx: &Context) -> FdwResult {
-        let this = Self::this_mut();
-        this.src_rows.clear();
-        Ok(())
-    }
-
-    fn begin_modify(_ctx: &Context) -> FdwResult {
-        Err("modify on foreign table is not supported".to_owned())
-    }
-
-    fn insert(_ctx: &Context, _row: &Row) -> FdwResult {
-        Ok(())
-    }
-
-    fn update(_ctx: &Context, _rowid: Cell, _row: &Row) -> FdwResult {
-        Ok(())
-    }
-
-    fn delete(_ctx: &Context, _rowid: Cell) -> FdwResult {
-        Ok(())
-    }
-
-    fn end_modify(_ctx: &Context) -> FdwResult {
-        Ok(())
+// Function to iterate over the parsed data and return one row at a time to PostgreSQL
+fn iter_scan(state: &mut MyFDWState) -> Result<Option<MyFDWRow>, Box<dyn Error>> {
+    // Pop a row from the parsed data vector
+    if let Some(row) = state.parsed_data.pop() {
+        Ok(Some(row))
+    } else {
+        Ok(None) // No more rows to return
     }
 }
 
-wit_bindgen_rt::export!("wasm_fdw_example.wit");
+// This main function might set up and register your FDW in a real environment
+// It will depend on your FDW framework and PostgreSQL setup
+fn main() {
+    // Register FDW, if necessary
+    // This is placeholder code and will need to be adapted to your specific setup
+    println!("Google Sheets FDW initialized and ready.");
+}
+
