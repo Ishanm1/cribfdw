@@ -1,24 +1,20 @@
 [package]
-name = "wasm_fdw_example"
+name = "google_sheets_fdw"
 version = "0.1.0"
-edition = "2021"
+authors = ["Your Name <you@example.com>"]
+edition = "2018"
 
+# Metadata for building the project as a WebAssembly module
 [lib]
 crate-type = ["cdylib"]
 
-[profile.release]
-strip = "debuginfo"
-lto = true
-
 [dependencies]
-wit-bindgen-rt = "0.26.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+reqwest = { version = "0.11", features = ["blocking", "json"] }
 
-[package.metadata.component]
-package = "my-company:example-fdw"
+# Add any other dependencies your project might need here
+# example-dependency = "0.1"
 
-[package.metadata.component.target]
-path = "wit"
-
-[package.metadata.component.target.dependencies]
-"supabase:wrappers" = { path = "./supabase-wrappers-wit" }
+[profile.release]
+opt-level = "z"  # Optimize for size, suitable for WebAssembly modules
